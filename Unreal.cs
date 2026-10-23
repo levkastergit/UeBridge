@@ -92,8 +92,8 @@ ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ editors = $eds; list
             try { j = JsonNode.Parse(json); } catch { }
             if (j?["result"] is JsonObject res)
             {
-                var si = res["serverInfo"];
-                return (true, $"MCP отвечает: {si?["name"]} {si?["version"]}, протокол {res["protocolVersion"]}");
+                var name = $"{res["serverInfo"]?["name"]} {res["serverInfo"]?["version"]}".Trim();
+                return (true, "MCP отвечает" + (name.Length > 0 ? ": " + name : "") + $", протокол {res["protocolVersion"]}");
             }
             // Ответ JSON-RPC с ошибкой тоже значит, что MCP-сервер работает — просто не принял тестовый запрос
             if (j?["jsonrpc"] != null && j["error"] != null)
@@ -212,7 +212,7 @@ ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ editors = $eds; list
         o.Save();
         onChanged(free);
         return $"OK: порт {old} занят ({string.Join(", ", busy.Select(Who))}), MCP переведён на порт {free}. "
-               + "Команды для ПК1 обновлены — если скрипт для ПК1 уже сохраняли, сохраните его заново.";
+               + "Команды для ПК Claude обновлены — если скрипт для ПК Claude уже сохраняли, сохраните его заново.";
     }
 
     // ---------- Шаг: добиться, чтобы MCP-сервер отвечал (запуск/перезапуск редактора) ----------

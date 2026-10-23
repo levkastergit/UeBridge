@@ -18,8 +18,11 @@ public sealed class MainForm : Form
     readonly Button btnApply = new() { Text = "Настроить всё", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
     readonly Button btnUpdate = new() { Text = "Обновить", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
     readonly Button btnStatus = new() { Text = "Проверить состояние", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
-    readonly Button btnScript = new() { Text = "Сохранить скрипт для ПК1…", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
-    readonly Button btnCopy = new() { Text = "Копировать текст для ПК1", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
+    readonly Button btnScript = new() { Text = "Сохранить скрипт для ПК Claude…", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
+    readonly Button btnCopy = new() { Text = "Копировать текст для ПК Claude", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
+    readonly TextBox txtPair = new() { Dock = DockStyle.Fill, Font = new Font("Consolas", 9f) };
+    readonly Button btnPair = new() { Text = "Подключить к ПК Claude", AutoSize = true, Padding = new Padding(6, 0, 6, 0) };
+    readonly Button btnRole = new() { Text = "Это ПК Claude…", AutoSize = true, Padding = new Padding(6, 0, 6, 0) };
 
     readonly TextBox txtInfo = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill, Font = new Font("Consolas", 9.5f) };
     readonly TextBox txtLog = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill, Font = new Font("Consolas", 9.5f) };
@@ -27,13 +30,14 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = $"UE Bridge {Updater.Current} — настройка ПК2 (Unreal) для Claude Code на ПК1";
+        Text = $"UE Bridge {Updater.Current} — ПК Unreal: настройка для Claude Code на ПК Claude";
         Font = new Font("Segoe UI", 9.75f);
         ClientSize = new Size(960, 780);
         MinimumSize = new Size(760, 600);
         StartPosition = FormStartPosition.CenterScreen;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(10) };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -68,44 +72,59 @@ public sealed class MainForm : Form
         p2.Controls.Add(numPort, 3, 0);
         p2.Controls.Add(Lbl("Путь:"), 4, 0);
         p2.Controls.Add(txtPath, 5, 0);
-        p2.Controls.Add(Lbl("Адрес ПК2 для ПК1:"), 6, 0);
+        p2.Controls.Add(Lbl("Адрес для ПК Claude:"), 6, 0);
         p2.Controls.Add(cmbHost, 7, 0);
-        p2.Controls.Add(Lbl("Диск на ПК1:"), 8, 0);
+        p2.Controls.Add(Lbl("Диск на ПК Claude:"), 8, 0);
         p2.Controls.Add(cmbDrive, 9, 0);
         root.Controls.Add(p2, 0, 1);
 
+        var pPair = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 4 };
+        pPair.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        pPair.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        pPair.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        pPair.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        pPair.Controls.Add(Lbl("Код подключения от ПК Claude:"), 0, 0);
+        pPair.Controls.Add(txtPair, 1, 0);
+        pPair.Controls.Add(btnPair, 2, 0);
+        pPair.Controls.Add(btnRole, 3, 0);
+        root.Controls.Add(pPair, 0, 2);
+
         var p3 = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Margin = new Padding(0, 6, 0, 6) };
         p3.Controls.AddRange(new Control[] { btnApply, btnUpdate, btnStatus, btnScript, btnCopy });
-        root.Controls.Add(p3, 0, 2);
+        root.Controls.Add(p3, 0, 3);
 
-        var g4 = new GroupBox { Text = "Данные и команды для ПК1", Dock = DockStyle.Fill, Padding = new Padding(8) };
+        var g4 = new GroupBox { Text = "Данные и команды для ПК Claude", Dock = DockStyle.Fill, Padding = new Padding(8) };
         g4.Controls.Add(txtInfo);
-        root.Controls.Add(g4, 0, 3);
+        root.Controls.Add(g4, 0, 4);
 
         var g5 = new GroupBox { Text = "Журнал", Dock = DockStyle.Fill, Padding = new Padding(8) };
         g5.Controls.Add(txtLog);
-        root.Controls.Add(g5, 0, 4);
+        root.Controls.Add(g5, 0, 5);
 
-        root.Controls.Add(lblStatus, 0, 5);
+        root.Controls.Add(lblStatus, 0, 6);
 
         var tip = new ToolTip();
         tip.SetToolTip(btnApply, "Включить OpenSSH Server, расшарить папку проекта, включить плагины MCP в .uproject, записать ini и .mcp.json, "
                                  + "запустить (или перезапустить) Unreal Editor и проверить MCP-сервер");
         tip.SetToolTip(btnUpdate, "Проверить, есть ли новая версия программы на GitHub, и заново применить все настройки");
         tip.SetToolTip(btnStatus, "Только проверить состояние, ничего не менять");
-        tip.SetToolTip(btnScript, "Сохранить .cmd-файл, который на ПК1 подключит папку, поднимет туннель и запустит Claude Code");
+        tip.SetToolTip(btnScript, "Только если ПК Claude и ПК Unreal в одной локальной сети: .cmd-файл, который на ПК Claude подключит папку, поднимет туннель и запустит Claude Code");
+        tip.SetToolTip(txtPair, "Если ПК Claude в другой сети (например, сервер в интернете): запустите UeBridge на ПК Claude, нажмите там «Настроить ПК Claude» и вставьте сюда код");
+        tip.SetToolTip(btnPair, "Принять код с ПК Claude и запустить обратный SSH-туннель: ПК Unreal сам подключается к ПК Claude и открывает там MCP и папку проекта");
+        btnPair.Click += async (_, _) => await Pair();
+        btnRole.Click += (_, _) => Program.SwitchRole(this, "claude");
 
         btnBrowse.Click += (_, _) => Browse();
         btnApply.Click += async (_, _) => await RunAll();
         btnUpdate.Click += async (_, _) => await UpdateAndRunAll();
         btnStatus.Click += async (_, _) => { if (ReadOptions(false)) await RefreshStatus(); };
         btnScript.Click += (_, _) => SaveScript();
-        btnCopy.Click += (_, _) => { if (txtInfo.Text.Length > 0) { Clipboard.SetText(txtInfo.Text); Log("Текст для ПК1 скопирован в буфер обмена"); } };
+        btnCopy.Click += (_, _) => { if (txtInfo.Text.Length > 0) { Clipboard.SetText(txtInfo.Text); Log("Текст для ПК Claude скопирован в буфер обмена"); } };
 
         FillFromOptions();
         Shown += async (_, _) =>
         {
-            Log($"UE Bridge {Updater.Current}. Запускать на ПК2 — там, где установлен Unreal Engine.");
+            Log($"UE Bridge {Updater.Current}. Запускать на ПК Unreal — там, где установлен Unreal Engine.");
             if (File.Exists(_opt.UProject)) await RefreshStatus();
             else Log("Выберите файл .uproject и нажмите «Настроить всё».");
         };
@@ -188,7 +207,7 @@ public sealed class MainForm : Form
     void SetBusy(bool busy)
     {
         _busy = busy;
-        foreach (var b in new[] { btnApply, btnUpdate, btnStatus, btnScript, btnBrowse }) b.Enabled = !busy;
+        foreach (var b in new[] { btnApply, btnUpdate, btnStatus, btnScript, btnBrowse, btnPair, btnRole }) b.Enabled = !busy;
         UseWaitCursor = busy;
     }
 
@@ -225,9 +244,11 @@ public sealed class MainForm : Form
         try
         {
             var o = _opt;
-            Log("=== Настройка ПК2 ===");
+            Log("=== Настройка ПК Unreal ===");
             int failed = 0;
-            if (!await Step("OpenSSH Server: служба sshd, автозапуск, правило брандмауэра на порт 22", () => Setup.EnsureOpenSsh(s => Log("    " + s)))) failed++;
+            var paired = Tunnel.Paired(o);
+            // В режиме туннеля ПК Unreal сам подключается к ПК Claude, свой SSH-сервер ему не нужен
+            if (!paired && !await Step("OpenSSH Server: служба sshd, автозапуск, правило брандмауэра на порт 22", () => Setup.EnsureOpenSsh(s => Log("    " + s)))) failed++;
             if (!await Step($"Сетевая папка \\\\{Environment.MachineName}\\{o.ShareName} -> {o.ProjectDir}", () => Setup.EnsureShare(o))) failed++;
             if (!await Step("Плагины ModelContextProtocol и AllToolsets в .uproject", () => Setup.EnableProjectPlugins(o))) failed++;
             if (!await Step($"Порт MCP {o.Port}: не занят ли другой программой", () => Unreal.EnsurePort(o, p => Invoke(new Action(() => numPort.Value = p))))) failed++;
@@ -235,7 +256,32 @@ public sealed class MainForm : Form
             if (!await Step(".mcp.json в папке проекта", () => Setup.WriteMcpJson(o))) failed++;
             if (!await Step("Проверка движка Unreal", () => Setup.CheckEngine(o))) failed++;
             if (!await Step("Unreal Editor и MCP-сервер: запуск и проверка по протоколу MCP", () => Unreal.EnsureMcp(o, s => Log("    " + s), Confirm))) failed++;
+            if (paired && !await Step($"Туннель к ПК Claude ({o.ClaudeHost}) и проверка со стороны ПК Claude", () => Tunnel.EnsureTunnel(o, s => Log("    " + s)))) failed++;
             Log(failed == 0 ? "=== Готово, ошибок нет ===" : $"=== Готово, замечаний: {failed} (см. выше) ===");
+            await RefreshStatusCore();
+        }
+        finally { SetBusy(false); }
+    }
+
+    async Task Pair()
+    {
+        if (_busy || !ReadOptions(true)) return;
+        if (txtPair.Text.Trim().Length == 0)
+        {
+            MessageBox.Show(this, "Вставьте код подключения: его показывает UeBridge на ПК Claude после «Настроить ПК Claude».", "UE Bridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        SetBusy(true);
+        try
+        {
+            var o = _opt;
+            var code = txtPair.Text;
+            Log("=== Подключение к ПК Claude ===");
+            if (await Step("Код подключения", () => Tunnel.Pair(o, code)))
+            {
+                txtPair.Text = "";
+                await Step($"Туннель к ПК Claude ({o.ClaudeHost}) и проверка со стороны ПК Claude", () => Tunnel.EnsureTunnel(o, s => Log("    " + s)));
+            }
             await RefreshStatusCore();
         }
         finally { SetBusy(false); }
@@ -279,14 +325,15 @@ public sealed class MainForm : Form
         var o = _opt;
         var s = await Task.Run(() => Setup.GetStatus(o));
         var (fix, notes) = Unreal.Diagnose(o, s);
-        txtInfo.Text = Setup.Pc1Info(o, s);
+        txtInfo.Text = Setup.ClaudePcInfo(o, s);
         var sshd = string.IsNullOrEmpty(s.Sshd) ? "не установлен" : s.Sshd;
         var editor = s.Editors.Any(e => e.ThisProject) ? "открыт" : s.Editors.Count > 0 ? "другой проект" : "нет";
         lblStatus.Text = $"sshd: {sshd}   |   порт 22: {(s.Fw22 ? "открыт" : "закрыт")}   |   папка: {(s.SharePath.Length > 0 ? "есть" : "нет")}   |   "
-                       + $"плагины: {(s.PluginsOn ? "вкл" : "выкл")}   |   редактор: {editor}   |   MCP {o.Port}: {(s.McpOk ? "отвечает" : "нет")}";
+                       + $"плагины: {(s.PluginsOn ? "вкл" : "выкл")}   |   редактор: {editor}   |   MCP {o.Port}: {(s.McpOk ? "отвечает" : "нет")}"
+                       + (Tunnel.Paired(o) ? $"   |   туннель к ПК Claude: {s.TunnelState}" : "");
         if (fix == McpFix.None)
         {
-            Log($"MCP-сервер Unreal отвечает на {o.McpUrl} ({s.McpInfo}). Можно подключаться с ПК1.");
+            Log($"MCP-сервер Unreal отвечает на {o.McpUrl} ({s.McpInfo}). Можно подключаться с ПК Claude.");
             return;
         }
         Log("MCP-сервер Unreal не отвечает. Диагностика:");
@@ -304,13 +351,13 @@ public sealed class MainForm : Form
         if (!ReadOptions(true)) return;
         using var dlg = new SaveFileDialog
         {
-            Title = "Сохранить скрипт для ПК1",
+            Title = "Сохранить скрипт для ПК Claude",
             Filter = "Командный файл (*.cmd)|*.cmd",
-            FileName = "Подключить-UE-с-ПК1.cmd",
+            FileName = "Подключить-UE-локальная-сеть.cmd",
             InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
         };
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        File.WriteAllText(dlg.FileName, Setup.Pc1Script(_opt), new System.Text.UTF8Encoding(false));
-        Log("Скрипт для ПК1 сохранён: " + dlg.FileName + " — перенесите его на ПК1 и запустите.");
+        File.WriteAllText(dlg.FileName, Setup.ClaudePcScript(_opt), new System.Text.UTF8Encoding(false));
+        Log("Скрипт для ПК Claude сохранён: " + dlg.FileName + " — перенесите его на ПК Claude и запустите.");
     }
 }

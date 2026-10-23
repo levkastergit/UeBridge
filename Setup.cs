@@ -18,6 +18,18 @@ public sealed class Options
     public string UrlPath { get; set; } = "/mcp";
     public string Host { get; set; } = "";
     public string Drive { get; set; } = "Z:";
+    /// <summary>"claude" или "unreal"; пусто — определить по наличию Unreal Engine.</summary>
+    public string Role { get; set; } = "";
+
+    // ПК Unreal: связь с ПК Claude через обратный SSH-туннель (заполняется из кода подключения)
+    public string ClaudeHost { get; set; } = "";
+    public int ClaudePort { get; set; } = 22;
+    public string ClaudeUser { get; set; } = "";
+    public int SmbTunnelPort { get; set; } = 44445;
+
+    // ПК Claude: адрес и порт, по которым к нему подключается ПК Unreal
+    public string PublicHost { get; set; } = "";
+    public int SshPort { get; set; } = 22;
 
     public string ProjectDir => Path.GetDirectoryName(UProject) ?? "";
     public string McpUrl => $"http://127.0.0.1:{Port}{UrlPath}";
@@ -64,6 +76,7 @@ public sealed class Status
     public List<EditorProc> Editors = new();
     public List<Listener> Listeners = new();
     public List<string> EditorLog = new();
+    public string TunnelState = "";
 }
 
 /// <summary>Запуск PowerShell-скриптов (Windows PowerShell 5.1, с правами администратора).</summary>
@@ -123,23 +136,27 @@ public static class Setup
     // Имя компонента — из документации Microsoft: learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse
     const string SshCapability = "OpenSSH.Server~~~~0.0.1.0";
 
-    public static string EnsureOpenSsh(Action<string> progress)
+    /// <summary>Ставит компонент Windows OpenSSH Server, если службы sshd ещё нет.</summary>
+    public static void InstallOpenSshServer(Action<string> progress)
     {
         var (code, output) = Ps.Run("if (Get-Service sshd -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }", 60_000);
         if (code != 0) throw new Exception(output);
-        if (output != "yes")
-        {
-            progress("Служба sshd не найдена. Устанавливаю компонент Windows " + SshCapability + " через Windows Update.");
-            progress("Нужен интернет; установка может идти несколько минут без вывода (ограничение — 20 мин). Программа не зависла.");
-            (code, output) = Ps.Run(@"
+        if (output == "yes") return;
+        progress("Служба sshd не найдена. Устанавливаю компонент Windows " + SshCapability + " через Windows Update.");
+        progress("Нужен интернет; установка может идти 20 минут и дольше без вывода (ограничение — 45 мин). Программа не зависла.");
+        (code, output) = Ps.Run(@"
 $r = Add-WindowsCapability -Online -Name __CAP__
 if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { throw 'служба sshd не появилась после установки компонента' }
 if ($r.RestartNeeded) { Write-Output 'Компонент установлен, Windows просит перезагрузку' } else { Write-Output 'Компонент установлен' }
-".Replace("__CAP__", Ps.Q(SshCapability)), 20 * 60_000);
-            if (code != 0) throw new Exception(output + "\n" + SshInstallHelp);
-            progress(output);
-        }
-        (code, output) = Ps.Run(@"
+".Replace("__CAP__", Ps.Q(SshCapability)), 45 * 60_000);
+        if (code != 0) throw new Exception(output + "\n" + SshInstallHelp);
+        progress(output);
+    }
+
+    public static string EnsureOpenSsh(Action<string> progress)
+    {
+        InstallOpenSshServer(progress);
+        var (code, output) = Ps.Run(@"
 Set-Service sshd -StartupType Automatic
 if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
 $rule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
@@ -160,7 +177,7 @@ Write-Output ('OK: служба sshd ' + (Get-Service sshd).Status + ', авто
         "  • Установить вручную: Пуск → «Дополнительные компоненты» (Optional features) → Просмотреть компоненты → OpenSSH Server → Добавить. Затем снова «Настроить всё».\n" +
         "  • Коды 0x800F0954, 0x8024402C, 0x80240438 означают, что Windows не может скачать компонент: нет интернета, либо обновления идут через WSUS/групповую политику.\n" +
         "  • Проверить состояние компонента (PowerShell от администратора): Get-WindowsCapability -Online -Name " + SshCapability + "\n" +
-        "  • После таймаута нажмите «Проверить состояние»: если sshd уже есть, снова «Настроить всё».";
+        "  • Windows может закончить установку в фоне уже после таймаута — через несколько минут нажмите «Проверить состояние»: если sshd уже есть, снова «Настроить всё».";
 
     // ---------- 2. Сетевая папка проекта ----------
     public static string EnsureShare(Options o)
@@ -313,6 +330,19 @@ Write-Output ('OK: \\' + $env:COMPUTERNAME + '\' + $name + '  ->  ' + $path + ' 
     }
 
     // ---------- 6. Проверка, что в движке есть плагин ModelContextProtocol ----------
+    /// <summary>Есть ли на этом ПК Unreal Engine (установленный из Epic Games Launcher или собранный из исходников).</summary>
+    public static bool EngineInstalled()
+    {
+        try
+        {
+            using var k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\EpicGames\Unreal Engine");
+            if (k != null && k.GetSubKeyNames().Length > 0) return true;
+            using var b = Registry.CurrentUser.OpenSubKey(@"Software\Epic Games\Unreal Engine\Builds");
+            return b != null && b.GetValueNames().Length > 0;
+        }
+        catch { return false; }
+    }
+
     static string? EngineAssociation(Options o)
     {
         try { return JsonNode.Parse(File.ReadAllText(o.UProject))?["EngineAssociation"]?.ToString(); }
@@ -412,6 +442,7 @@ $r | ConvertTo-Json -Compress
         }
         catch { }
         if (!s.McpOk) s.EditorLog = Unreal.EditorLog(o);
+        s.TunnelState = Tunnel.State(o);
         return s;
     }
 
@@ -448,21 +479,22 @@ $r | ConvertTo-Json -Compress
         return list;
     }
 
-    // ---------- Тексты для ПК1 ----------
-    public static string Pc1Info(Options o, Status s)
+    // ---------- Тексты для ПК Claude ----------
+    public static string ClaudePcInfo(Options o, Status s)
     {
+        if (Tunnel.Paired(o)) return ClaudePcInfoTunnel(o, s);
         var sb = new StringBuilder();
         var host = o.HostOrName;
-        sb.AppendLine("ДЛЯ ПК1 (где установлен Claude Code)");
+        sb.AppendLine("ДЛЯ ПК Claude (где установлен Claude Code)");
         sb.AppendLine();
-        sb.AppendLine($"Имя этого компьютера (ПК2):  {Environment.MachineName}");
+        sb.AppendLine($"Имя этого компьютера (ПК Unreal):  {Environment.MachineName}");
         var ips = LocalIPv4();
-        sb.AppendLine($"IP-адреса ПК2:               {(ips.Count == 0 ? "не найдены" : string.Join(", ", ips.Select(x => $"{x.Ip} ({x.Iface})")))}");
-        sb.AppendLine($"Пользователь для SSH:        {o.SshUser}   (пароль = пароль входа в Windows на ПК2)");
+        sb.AppendLine($"IP-адреса ПК Unreal:               {(ips.Count == 0 ? "не найдены" : string.Join(", ", ips.Select(x => $"{x.Ip} ({x.Iface})")))}");
+        sb.AppendLine($"Пользователь для SSH:        {o.SshUser}   (пароль = пароль входа в Windows на ПК Unreal)");
         sb.AppendLine($"Сетевая папка проекта:       \\\\{host}\\{o.ShareName}");
         sb.AppendLine($"MCP-сервер Unreal:           {o.McpUrl}   (через SSH-туннель)");
         sb.AppendLine();
-        sb.AppendLine("Команды на ПК1 (cmd или PowerShell), по порядку:");
+        sb.AppendLine("Команды на ПК Claude (cmd или PowerShell), по порядку:");
         sb.AppendLine($"  net use {o.Drive} \\\\{host}\\{o.ShareName} /persistent:yes");
         sb.AppendLine($"  ssh -N -L {o.Port}:127.0.0.1:{o.Port} {o.SshUser}@{host}        (окно не закрывать)");
         sb.AppendLine($"  cd /d {o.Drive}\\");
@@ -470,9 +502,9 @@ $r | ConvertTo-Json -Compress
         sb.AppendLine();
         sb.AppendLine("В Claude Code: /plugin install unreal-engine-skills-for-claude-code@claude-plugins-official");
         sb.AppendLine("Проверка: команда /mcp должна показать unreal-mcp как подключённый.");
-        sb.AppendLine("Если имя ПК2 не находится по сети, подставьте вместо него IP-адрес из списка выше.");
+        sb.AppendLine("Если имя ПК Unreal не находится по сети, подставьте вместо него IP-адрес из списка выше.");
         sb.AppendLine();
-        sb.AppendLine("Состояние ПК2 сейчас:");
+        sb.AppendLine("Состояние ПК Unreal сейчас:");
         sb.AppendLine($"  sshd:               {(string.IsNullOrEmpty(s.Sshd) ? "не установлен" : s.Sshd + " / " + s.SshdStart)}");
         sb.AppendLine($"  порт 22 открыт:     {(s.Fw22 ? "да" : "нет")}");
         sb.AppendLine($"  сетевая папка:      {(string.IsNullOrEmpty(s.SharePath) ? "нет" : s.SharePath)}");
@@ -484,13 +516,40 @@ $r | ConvertTo-Json -Compress
         return sb.ToString();
     }
 
-    public static string Pc1Script(Options o)
+    static string ClaudePcInfoTunnel(Options o, Status s)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("ПК Claude — связь через обратный SSH-туннель");
+        sb.AppendLine();
+        sb.AppendLine($"ПК Claude:                         {o.ClaudeUser}@{o.ClaudeHost}:{o.ClaudePort}");
+        sb.AppendLine($"Туннель:                     {s.TunnelState}   (задача «{Tunnel.TaskName}», запускается сама при включении ПК Unreal)");
+        sb.AppendLine($"На ПК Claude откроются:            127.0.0.1:{o.Port} — MCP-сервер Unreal, 127.0.0.1:{o.SmbTunnelPort} — папка проекта");
+        sb.AppendLine($"Пользователь для папки:      {Environment.UserDomainName}\\{Environment.UserName}   (пароль = пароль входа в Windows на ПК Unreal)");
+        sb.AppendLine();
+        sb.AppendLine("На ПК Claude:");
+        sb.AppendLine($"  1. Запустите «Подключить-UE.cmd» на рабочем столе (или «Подключить проект» в UeBridge на ПК Claude).");
+        sb.AppendLine($"     Он подключит папку проекта как {o.Drive} и откроет её в Cursor / VS Code.");
+        sb.AppendLine("     При первом запуске спросит пароль Windows от ПК Unreal и запомнит его.");
+        sb.AppendLine("  2. В Claude Code один раз: /plugin install unreal-engine-skills-for-claude-code@claude-plugins-official");
+        sb.AppendLine("  3. Проверка: /mcp должен показать unreal-mcp как подключённый.");
+        sb.AppendLine();
+        sb.AppendLine("Состояние ПК Unreal сейчас:");
+        sb.AppendLine($"  сетевая папка:      {(string.IsNullOrEmpty(s.SharePath) ? "нет" : s.SharePath)}");
+        sb.AppendLine($"  плагины в .uproject:{(s.PluginsOn ? " включены" : " не включены")}");
+        sb.AppendLine($"  ini / .mcp.json:    {(s.IniOk ? "да" : "нет")} / {(s.McpJsonOk ? "да" : "нет")}");
+        var ed = s.Editors.FirstOrDefault(e => e.ThisProject);
+        sb.AppendLine($"  Unreal Editor:      {(ed != null ? $"запущен с этим проектом (PID {ed.Pid}, с {ed.Started:HH:mm:ss})" : s.Editors.Count > 0 ? "запущен с другим проектом" : "не запущен")}");
+        sb.AppendLine($"  MCP-сервер:         {(s.McpOk ? s.McpInfo : "не отвечает — " + s.McpInfo)}");
+        return sb.ToString();
+    }
+
+    public static string ClaudePcScript(Options o)
     {
         var host = o.HostOrName;
         var sb = new StringBuilder();
         sb.Append("@echo off\r\n");
         sb.Append("chcp 65001 >nul\r\n");
-        sb.Append("title UE Bridge: подключение ПК1 к ПК2\r\n");
+        sb.Append("title UE Bridge: подключение ПК Claude к ПК Unreal\r\n");
         sb.Append($"set HOST={host}\r\n");
         sb.Append($"set SHARE={o.ShareName}\r\n");
         sb.Append($"set SSHUSER={o.SshUser}\r\n");
@@ -499,7 +558,7 @@ $r | ConvertTo-Json -Compress
         sb.Append("\r\n");
         sb.Append("echo [1/3] Сетевая папка %DRIVE% = \\\\%HOST%\\%SHARE%\r\n");
         sb.Append("if not exist %DRIVE%\\ net use %DRIVE% \\\\%HOST%\\%SHARE% /persistent:yes\r\n");
-        sb.Append("if not exist %DRIVE%\\ ( echo Не удалось подключить папку. Проверьте имя/IP ПК2 и пароль. & pause & exit /b 1 )\r\n");
+        sb.Append("if not exist %DRIVE%\\ ( echo Не удалось подключить папку. Проверьте имя/IP ПК Unreal и пароль. & pause & exit /b 1 )\r\n");
         sb.Append("\r\n");
         sb.Append("echo [2/3] SSH-туннель на порт %PORT% (окно \"UE MCP tunnel\" не закрывать)\r\n");
         sb.Append("start \"UE MCP tunnel\" ssh -N -L %PORT%:127.0.0.1:%PORT% %SSHUSER%@%HOST%\r\n");
