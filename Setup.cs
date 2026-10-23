@@ -66,7 +66,7 @@ public static class Ps
 {
     public static (int Code, string Out) Run(string script, int timeoutMs = 900_000)
     {
-        var full = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8\n$ErrorActionPreference='Stop'\ntry {\n"
+        var full = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8\n$ErrorActionPreference='Stop'\n$ProgressPreference='SilentlyContinue'\ntry {\n"
                    + script + "\n} catch { Write-Output ('ОШИБКА: ' + $_.Exception.Message); exit 1 }";
         var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(full));
         var psi = new ProcessStartInfo("powershell.exe",
@@ -79,17 +79,27 @@ public static class Ps
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
         };
-        using var p = Process.Start(psi) ?? throw new Exception("не удалось запустить powershell.exe");
-        var so = p.StandardOutput.ReadToEndAsync();
-        var se = p.StandardError.ReadToEndAsync();
+        var buf = new StringBuilder();
+        var outEof = new TaskCompletionSource();
+        var errEof = new TaskCompletionSource();
+        using var p = new Process { StartInfo = psi };
+        p.OutputDataReceived += (_, e) => { if (e.Data == null) outEof.TrySetResult(); else lock (buf) buf.AppendLine(e.Data); };
+        // PowerShell 5.1 с -EncodedCommand пишет в перенаправленный stderr служебные записи (прогресс) в формате CLIXML — это не ошибки
+        p.ErrorDataReceived += (_, e) => { if (e.Data == null) errEof.TrySetResult(); else if (!IsClixml(e.Data)) lock (buf) buf.AppendLine(e.Data); };
+        if (!p.Start()) throw new Exception("не удалось запустить powershell.exe");
+        p.BeginOutputReadLine();
+        p.BeginErrorReadLine();
         if (!p.WaitForExit(timeoutMs))
         {
             try { p.Kill(true); } catch { }
-            return (-1, "таймаут выполнения PowerShell");
+            lock (buf) return (-1, $"таймаут выполнения PowerShell ({timeoutMs / 1000} с)" + (buf.Length > 0 ? "\n" + buf.ToString().Trim() : ""));
         }
-        var text = (so.Result + se.Result).Trim();
-        return (p.ExitCode, text);
+        // Вывод может держать открытым процесс, порождённый скриптом, — не ждём его конца бесконечно
+        Task.WaitAll(new[] { outEof.Task, errEof.Task }, 5_000);
+        lock (buf) return (p.ExitCode, buf.ToString().Trim());
     }
+
+    static bool IsClixml(string line) => line.StartsWith("#< CLIXML") || line.StartsWith("<Objs ");
 
     /// <summary>Строка в одинарных кавычках PowerShell.</summary>
     public static string Q(string s) => "'" + s.Replace("'", "''") + "'";
@@ -105,20 +115,26 @@ public static class Setup
     static string McpJsonPath(Options o) => Path.Combine(o.ProjectDir, ".mcp.json");
 
     // ---------- 1. OpenSSH Server (стандартный компонент Windows) ----------
-    public static string EnsureOpenSsh()
+    // Имя компонента — из документации Microsoft: learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse
+    const string SshCapability = "OpenSSH.Server~~~~0.0.1.0";
+
+    public static string EnsureOpenSsh(Action<string> progress)
     {
-        var (code, output) = Ps.Run(@"
-$svc = Get-Service sshd -ErrorAction SilentlyContinue
-if (-not $svc) {
-    $cap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*' | Select-Object -First 1
-    if (-not $cap) { throw 'компонент OpenSSH.Server не найден в этой версии Windows' }
-    if ($cap.State -ne 'Installed') {
-        Write-Output 'Устанавливаю компонент Windows OpenSSH Server (нужен интернет, может занять минуту)...'
-        Add-WindowsCapability -Online -Name $cap.Name | Out-Null
-    }
-    $svc = Get-Service sshd -ErrorAction SilentlyContinue
-    if (-not $svc) { throw 'служба sshd не появилась после установки компонента' }
-}
+        var (code, output) = Ps.Run("if (Get-Service sshd -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }", 60_000);
+        if (code != 0) throw new Exception(output);
+        if (output != "yes")
+        {
+            progress("Служба sshd не найдена. Устанавливаю компонент Windows " + SshCapability + " через Windows Update.");
+            progress("Нужен интернет; установка может идти несколько минут без вывода (ограничение — 20 мин). Программа не зависла.");
+            (code, output) = Ps.Run(@"
+$r = Add-WindowsCapability -Online -Name __CAP__
+if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { throw 'служба sshd не появилась после установки компонента' }
+if ($r.RestartNeeded) { Write-Output 'Компонент установлен, Windows просит перезагрузку' } else { Write-Output 'Компонент установлен' }
+".Replace("__CAP__", Ps.Q(SshCapability)), 20 * 60_000);
+            if (code != 0) throw new Exception(output + "\n" + SshInstallHelp);
+            progress(output);
+        }
+        (code, output) = Ps.Run(@"
 Set-Service sshd -StartupType Automatic
 if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
 $rule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
@@ -128,10 +144,18 @@ if (-not $rule) {
     Enable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP'
 }
 Write-Output ('OK: служба sshd ' + (Get-Service sshd).Status + ', автозапуск, порт 22 открыт для частной сети')
-");
+", 300_000);
         if (code != 0) throw new Exception(output);
         return output;
     }
+
+    // Коды ошибок и ручная установка — по статье learn.microsoft.com/troubleshoot/windows-server/system-management-components/cant-install-openssh-features
+    const string SshInstallHelp =
+        "OpenSSH Server не установился автоматически. Что можно сделать:\n" +
+        "  • Установить вручную: Пуск → «Дополнительные компоненты» (Optional features) → Просмотреть компоненты → OpenSSH Server → Добавить. Затем снова «Настроить всё».\n" +
+        "  • Коды 0x800F0954, 0x8024402C, 0x80240438 означают, что Windows не может скачать компонент: нет интернета, либо обновления идут через WSUS/групповую политику.\n" +
+        "  • Проверить состояние компонента (PowerShell от администратора): Get-WindowsCapability -Online -Name " + SshCapability + "\n" +
+        "  • После таймаута нажмите «Проверить состояние»: если sshd уже есть, снова «Настроить всё».";
 
     // ---------- 2. Сетевая папка проекта ----------
     public static string EnsureShare(Options o)

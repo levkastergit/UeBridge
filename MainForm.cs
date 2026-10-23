@@ -200,9 +200,13 @@ public sealed class MainForm : Form
     async Task<bool> Step(string title, Func<string> work)
     {
         Log("• " + title);
+        var sw = Stopwatch.StartNew();
+        var task = Task.Run(work);
+        while (await Task.WhenAny(task, Task.Delay(30_000)) != task)
+            Log($"    …ещё выполняется ({sw.Elapsed:m\\:ss})");
         try
         {
-            var result = await Task.Run(work);
+            var result = await task;
             Log("    " + result.Replace("\n", "\r\n    "));
             return !result.StartsWith("ВНИМАНИЕ");
         }
@@ -222,7 +226,7 @@ public sealed class MainForm : Form
             var o = _opt;
             Log("=== Настройка ПК2 ===");
             int failed = 0;
-            if (!await Step("OpenSSH Server: служба sshd, автозапуск, правило брандмауэра на порт 22", Setup.EnsureOpenSsh)) failed++;
+            if (!await Step("OpenSSH Server: служба sshd, автозапуск, правило брандмауэра на порт 22", () => Setup.EnsureOpenSsh(s => Log("    " + s)))) failed++;
             if (!await Step($"Сетевая папка \\\\{Environment.MachineName}\\{o.ShareName} -> {o.ProjectDir}", () => Setup.EnsureShare(o))) failed++;
             if (!await Step("Плагины ModelContextProtocol и AllToolsets в .uproject", () => Setup.EnableProjectPlugins(o))) failed++;
             if (!await Step("Настройки MCP-сервера в Saved/Config/WindowsEditor/EditorPerProjectUserSettings.ini", () => Setup.WriteIni(o))) failed++;
