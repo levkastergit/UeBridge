@@ -54,11 +54,16 @@ public sealed class Status
     public string SshdStart = "";
     public string SharePath = "";
     public bool Fw22;
-    public bool EditorRunning;
     public bool McpPort;
+    public bool McpOk;
+    public string McpInfo = "";
     public bool PluginsOn;
     public bool IniOk;
     public bool McpJsonOk;
+    public DateTime ConfigChanged;
+    public List<EditorProc> Editors = new();
+    public List<Listener> Listeners = new();
+    public List<string> EditorLog = new();
 }
 
 /// <summary>Запуск PowerShell-скриптов (Windows PowerShell 5.1, с правами администратора).</summary>
@@ -228,7 +233,7 @@ Write-Output ('OK: \\' + $env:COMPUTERNAME + '\' + $name + '  ->  ' + $path + ' 
         });
         File.WriteAllText(o.UProject, json, new UTF8Encoding(false));
         return "OK: включены плагины " + string.Join(", ", changed)
-               + " (копия оригинала: .uproject.bak). Перезапустите Unreal Editor, чтобы плагины загрузились.";
+               + " (копия оригинала: .uproject.bak). Если редактор открыт, его перезапустит шаг «Unreal Editor и MCP-сервер».";
     }
 
     // ---------- 4. INI с настройками MCP-сервера ----------
@@ -243,6 +248,7 @@ Write-Output ('OK: \\' + $env:COMPUTERNAME + '\' + $name + '  ->  ' + $path + ' 
             ("bAutoStartServer", "True"),
         };
         var lines = File.Exists(file) ? File.ReadAllLines(file).ToList() : new List<string>();
+        var before = lines.ToList();
         int start = lines.FindIndex(l => l.Trim().Equals(IniSection, StringComparison.OrdinalIgnoreCase));
         if (start < 0)
         {
@@ -262,8 +268,24 @@ Write-Output ('OK: \\' + $env:COMPUTERNAME + '\' + $name + '  ->  ' + $path + ' 
             int ins = start + 1;
             foreach (var (k, v) in wanted) lines.Insert(ins++, $"{k}={v}");
         }
+        // Без изменений файл не трогаем: по времени его изменения диагностика понимает, загрузил ли его редактор
+        if (lines.SequenceEqual(before)) return "OK: " + file + "  (уже настроено)";
         File.WriteAllLines(file, lines, new UTF8Encoding(false));
         return "OK: " + file + $"  (порт {o.Port}, путь {o.UrlPath}, автозапуск сервера)";
+    }
+
+    static Dictionary<string, string> IniValues(Options o)
+    {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        bool inside = false;
+        foreach (var raw in File.ReadAllLines(IniPath(o)))
+        {
+            var l = raw.Trim();
+            if (l.StartsWith('[')) { inside = l.Equals(IniSection, StringComparison.OrdinalIgnoreCase); continue; }
+            var kv = l.Split('=', 2);
+            if (inside && kv.Length == 2) d[kv[0].Trim()] = kv[1].Trim().Trim('"');
+        }
+        return d;
     }
 
     // ---------- 5. .mcp.json ----------
@@ -291,24 +313,37 @@ Write-Output ('OK: \\' + $env:COMPUTERNAME + '\' + $name + '  ->  ' + $path + ' 
     }
 
     // ---------- 6. Проверка, что в движке есть плагин ModelContextProtocol ----------
+    static string? EngineAssociation(Options o)
+    {
+        try { return JsonNode.Parse(File.ReadAllText(o.UProject))?["EngineAssociation"]?.ToString(); }
+        catch { return null; }
+    }
+
+    /// <summary>Папка движка из EngineAssociation в .uproject: установленные версии — HKLM, собранные из исходников — HKCU.</summary>
+    public static string? EngineDir(Options o)
+    {
+        var assoc = EngineAssociation(o);
+        if (string.IsNullOrEmpty(assoc)) return null;
+        string? dir;
+        using (var k = Registry.LocalMachine.OpenSubKey($@"SOFTWARE\EpicGames\Unreal Engine\{assoc}"))
+            dir = k?.GetValue("InstalledDirectory") as string;
+        if (string.IsNullOrEmpty(dir))
+        {
+            using var b = Registry.CurrentUser.OpenSubKey(@"Software\Epic Games\Unreal Engine\Builds");
+            dir = b?.GetValue(assoc) as string;
+        }
+        return !string.IsNullOrEmpty(dir) && Directory.Exists(dir) ? dir : null;
+    }
+
     public static string CheckEngine(Options o)
     {
-        string? assoc = null;
-        try { assoc = JsonNode.Parse(File.ReadAllText(o.UProject))?["EngineAssociation"]?.ToString(); } catch { }
-        string? engineDir = null;
-        if (!string.IsNullOrEmpty(assoc))
+        var engineDir = EngineDir(o);
+        if (engineDir == null)
         {
-            using var k = Registry.LocalMachine.OpenSubKey($@"SOFTWARE\EpicGames\Unreal Engine\{assoc}");
-            engineDir = k?.GetValue("InstalledDirectory") as string;
-            if (string.IsNullOrEmpty(engineDir))
-            {
-                using var b = Registry.CurrentUser.OpenSubKey(@"Software\Epic Games\Unreal Engine\Builds");
-                engineDir = b?.GetValue(assoc) as string;
-            }
-        }
-        if (string.IsNullOrEmpty(engineDir) || !Directory.Exists(engineDir))
+            var assoc = EngineAssociation(o);
             return $"ВНИМАНИЕ: папка движка не найдена (EngineAssociation = {(string.IsNullOrEmpty(assoc) ? "не задан" : assoc)}). "
                    + "Проверьте вручную, что в движке есть плагин ModelContextProtocol (Edit -> Plugins).";
+        }
 
         var plugins = Path.Combine(engineDir, "Engine", "Plugins");
         bool found = Directory.Exists(Path.Combine(plugins, "Experimental", PluginMcp));
@@ -350,9 +385,10 @@ $r | ConvertTo-Json -Compress
             }
             catch { }
         }
-        s.EditorRunning = Process.GetProcessesByName("UnrealEditor").Length > 0
-                          || Process.GetProcessesByName("UnrealEditor-Cmd").Length > 0;
+        try { (s.Editors, s.Listeners) = Unreal.Scan(o); }
+        catch { }
         s.McpPort = PortOpen(o.Port);
+        (s.McpOk, s.McpInfo) = s.McpPort ? Unreal.McpProbe(o) : (false, $"порт {o.Port} на 127.0.0.1 закрыт");
         try
         {
             if (File.Exists(o.UProject))
@@ -361,15 +397,25 @@ $r | ConvertTo-Json -Compress
                 s.PluginsOn = plugins != null && new[] { PluginMcp, PluginTools }.All(n =>
                     plugins.OfType<JsonObject>().Any(p => p["Name"]?.ToString() == n
                         && string.Equals(p["Enabled"]?.ToString(), "true", StringComparison.OrdinalIgnoreCase)));
+                s.ConfigChanged = File.GetLastWriteTime(o.UProject);
             }
-            s.IniOk = File.Exists(IniPath(o)) && File.ReadAllText(IniPath(o)).Contains(IniSection, StringComparison.OrdinalIgnoreCase);
+            if (File.Exists(IniPath(o)))
+            {
+                var v = IniValues(o);
+                s.IniOk = v.TryGetValue("bAutoStartServer", out var a) && a.Equals("True", StringComparison.OrdinalIgnoreCase)
+                          && v.TryGetValue("ServerPortNumber", out var p) && p == o.Port.ToString()
+                          && v.TryGetValue("ServerUrlPath", out var u) && u == o.UrlPath;
+                var t = File.GetLastWriteTime(IniPath(o));
+                if (t > s.ConfigChanged) s.ConfigChanged = t;
+            }
             s.McpJsonOk = File.Exists(McpJsonPath(o)) && File.ReadAllText(McpJsonPath(o)).Contains("unreal-mcp");
         }
         catch { }
+        if (!s.McpOk) s.EditorLog = Unreal.EditorLog(o);
         return s;
     }
 
-    static bool PortOpen(int port)
+    public static bool PortOpen(int port)
     {
         try
         {
@@ -432,8 +478,9 @@ $r | ConvertTo-Json -Compress
         sb.AppendLine($"  сетевая папка:      {(string.IsNullOrEmpty(s.SharePath) ? "нет" : s.SharePath)}");
         sb.AppendLine($"  плагины в .uproject:{(s.PluginsOn ? " включены" : " не включены")}");
         sb.AppendLine($"  ini / .mcp.json:    {(s.IniOk ? "да" : "нет")} / {(s.McpJsonOk ? "да" : "нет")}");
-        sb.AppendLine($"  Unreal Editor:      {(s.EditorRunning ? "запущен" : "не запущен")}");
-        sb.AppendLine($"  MCP порт {o.Port}:      {(s.McpPort ? "отвечает" : "не отвечает (запустите редактор с этим проектом)")}");
+        var ed = s.Editors.FirstOrDefault(e => e.ThisProject);
+        sb.AppendLine($"  Unreal Editor:      {(ed != null ? $"запущен с этим проектом (PID {ed.Pid}, с {ed.Started:HH:mm:ss})" : s.Editors.Count > 0 ? "запущен с другим проектом" : "не запущен")}");
+        sb.AppendLine($"  MCP-сервер:         {(s.McpOk ? s.McpInfo : "не отвечает — " + s.McpInfo)}");
         return sb.ToString();
     }
 

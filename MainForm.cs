@@ -89,7 +89,8 @@ public sealed class MainForm : Form
         root.Controls.Add(lblStatus, 0, 5);
 
         var tip = new ToolTip();
-        tip.SetToolTip(btnApply, "Включить OpenSSH Server, расшарить папку проекта, включить плагины MCP в .uproject, записать ini и .mcp.json");
+        tip.SetToolTip(btnApply, "Включить OpenSSH Server, расшарить папку проекта, включить плагины MCP в .uproject, записать ini и .mcp.json, "
+                                 + "запустить (или перезапустить) Unreal Editor и проверить MCP-сервер");
         tip.SetToolTip(btnUpdate, "Проверить, есть ли новая версия программы на GitHub, и заново применить все настройки");
         tip.SetToolTip(btnStatus, "Только проверить состояние, ничего не менять");
         tip.SetToolTip(btnScript, "Сохранить .cmd-файл, который на ПК1 подключит папку, поднимет туннель и запустит Claude Code");
@@ -229,9 +230,11 @@ public sealed class MainForm : Form
             if (!await Step("OpenSSH Server: служба sshd, автозапуск, правило брандмауэра на порт 22", () => Setup.EnsureOpenSsh(s => Log("    " + s)))) failed++;
             if (!await Step($"Сетевая папка \\\\{Environment.MachineName}\\{o.ShareName} -> {o.ProjectDir}", () => Setup.EnsureShare(o))) failed++;
             if (!await Step("Плагины ModelContextProtocol и AllToolsets в .uproject", () => Setup.EnableProjectPlugins(o))) failed++;
+            if (!await Step($"Порт MCP {o.Port}: не занят ли другой программой", () => Unreal.EnsurePort(o, p => Invoke(new Action(() => numPort.Value = p))))) failed++;
             if (!await Step("Настройки MCP-сервера в Saved/Config/WindowsEditor/EditorPerProjectUserSettings.ini", () => Setup.WriteIni(o))) failed++;
             if (!await Step(".mcp.json в папке проекта", () => Setup.WriteMcpJson(o))) failed++;
             if (!await Step("Проверка движка Unreal", () => Setup.CheckEngine(o))) failed++;
+            if (!await Step("Unreal Editor и MCP-сервер: запуск и проверка по протоколу MCP", () => Unreal.EnsureMcp(o, s => Log("    " + s), Confirm))) failed++;
             Log(failed == 0 ? "=== Готово, ошибок нет ===" : $"=== Готово, замечаний: {failed} (см. выше) ===");
             await RefreshStatusCore();
         }
@@ -275,17 +278,26 @@ public sealed class MainForm : Form
     {
         var o = _opt;
         var s = await Task.Run(() => Setup.GetStatus(o));
+        var (fix, notes) = Unreal.Diagnose(o, s);
         txtInfo.Text = Setup.Pc1Info(o, s);
         var sshd = string.IsNullOrEmpty(s.Sshd) ? "не установлен" : s.Sshd;
+        var editor = s.Editors.Any(e => e.ThisProject) ? "открыт" : s.Editors.Count > 0 ? "другой проект" : "нет";
         lblStatus.Text = $"sshd: {sshd}   |   порт 22: {(s.Fw22 ? "открыт" : "закрыт")}   |   папка: {(s.SharePath.Length > 0 ? "есть" : "нет")}   |   "
-                       + $"плагины: {(s.PluginsOn ? "вкл" : "выкл")}   |   редактор: {(s.EditorRunning ? "запущен" : "нет")}   |   MCP {o.Port}: {(s.McpPort ? "отвечает" : "нет")}";
-        if (!s.McpPort)
-            Log(s.EditorRunning
-                ? $"Редактор запущен, но порт {o.Port} не отвечает. Если редактор был запущен до настройки — перезапустите его, либо в его консоли: ModelContextProtocol.StartServer"
-                : "Unreal Editor не запущен. Откройте проект в редакторе: MCP-сервер стартует автоматически (bAutoStartServer=True).");
-        else
-            Log($"MCP-сервер Unreal отвечает на {o.McpUrl}. Можно подключаться с ПК1.");
+                       + $"плагины: {(s.PluginsOn ? "вкл" : "выкл")}   |   редактор: {editor}   |   MCP {o.Port}: {(s.McpOk ? "отвечает" : "нет")}";
+        if (fix == McpFix.None)
+        {
+            Log($"MCP-сервер Unreal отвечает на {o.McpUrl} ({s.McpInfo}). Можно подключаться с ПК1.");
+            return;
+        }
+        Log("MCP-сервер Unreal не отвечает. Диагностика:");
+        foreach (var n in notes) Log("    " + n);
+        Log(fix == McpFix.Unknown
+            ? "    Автоматического исправления для этого случая нет — пришлите этот журнал."
+            : "    Нажмите «Настроить всё» — программа исправит это сама.");
     }
+
+    bool Confirm(string message) => (bool)Invoke(new Func<bool>(() =>
+        MessageBox.Show(this, message, "UE Bridge", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes));
 
     void SaveScript()
     {
