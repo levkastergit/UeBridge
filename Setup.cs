@@ -330,6 +330,75 @@ Write-Output ('OK: \\' + $env:COMPUTERNAME + '\' + $name + '  ->  ' + $path + ' 
     }
 
     // ---------- 6. Проверка, что в движке есть плагин ModelContextProtocol ----------
+    /// <summary>Проекты Unreal на этом ПК, сначала тот, что открывали последним. Источники: пути к .uproject в настройках
+    /// редактора (%LOCALAPPDATA%\UnrealEngine\*\Saved\Config), «Документы\Unreal Projects» и неглубокий поиск по локальным дискам.</summary>
+    public static List<string> FindProjects()
+    {
+        var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Add(string p) { try { var f = Path.GetFullPath(p.Replace('/', '\\')); if (File.Exists(f)) found.Add(f); } catch { } }
+
+        var ueCfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UnrealEngine");
+        try
+        {
+            if (Directory.Exists(ueCfg))
+                foreach (var ver in Directory.GetDirectories(ueCfg))
+                {
+                    var cfg = Path.Combine(ver, "Saved", "Config");
+                    if (!Directory.Exists(cfg)) continue;
+                    foreach (var ini in Directory.EnumerateFiles(cfg, "*.ini", SearchOption.AllDirectories))
+                        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
+                                     File.ReadAllText(ini), @"[A-Za-z]:[\\/][^""\r\n,()=]*?\.uproject"))
+                            Add(m.Value);
+                }
+        }
+        catch { }
+
+        try
+        {
+            var docs = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Unreal Projects");
+            if (Directory.Exists(docs))
+                foreach (var d in Directory.GetDirectories(docs))
+                    foreach (var f in Directory.GetFiles(d, "*.uproject")) Add(f);
+        }
+        catch { }
+
+        // Неглубокий поиск: диск\папка\проект\*.uproject (до 3 уровней), не дольше 8 с
+        var skip = new[] { "Windows", "Program Files", "Program Files (x86)", "ProgramData", "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs" };
+        var sw = Stopwatch.StartNew();
+        void Scan(string dir, int depth)
+        {
+            if (depth > 3 || sw.Elapsed > TimeSpan.FromSeconds(8)) return;
+            try
+            {
+                foreach (var f in Directory.EnumerateFiles(dir, "*.uproject")) Add(f);
+                foreach (var d in Directory.EnumerateDirectories(dir))
+                {
+                    var name = Path.GetFileName(d);
+                    if (depth == 0 && skip.Contains(name, StringComparer.OrdinalIgnoreCase)) continue;
+                    if (name.StartsWith('.') || name is "AppData" or "node_modules" or "Intermediate" or "DerivedDataCache" or "Saved" or "Binaries") continue;
+                    Scan(d, depth + 1);
+                }
+            }
+            catch { }
+        }
+        foreach (var drive in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Fixed && d.IsReady)) Scan(drive.RootDirectory.FullName, 0);
+
+        // Последний открытый — по журналу редактора (Saved\Logs), иначе по самому .uproject
+        static DateTime LastUse(string p)
+        {
+            var t = File.GetLastWriteTime(p);
+            try
+            {
+                var logs = Path.Combine(Path.GetDirectoryName(p)!, "Saved", "Logs");
+                if (Directory.Exists(logs))
+                    foreach (var l in Directory.EnumerateFiles(logs, "*.log")) { var lt = File.GetLastWriteTime(l); if (lt > t) t = lt; }
+            }
+            catch { }
+            return t;
+        }
+        return found.OrderByDescending(LastUse).ToList();
+    }
+
     /// <summary>Есть ли на этом ПК Unreal Engine (установленный из Epic Games Launcher или собранный из исходников).</summary>
     public static bool EngineInstalled()
     {

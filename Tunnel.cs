@@ -124,6 +124,13 @@ public static class Tunnel
 
     public static bool Paired(Options o) => o.ClaudeHost.Length > 0 && File.Exists(KeyFile) && File.Exists(KnownHosts);
 
+    /// <summary>Тот же ли ключ уже сохранён на этом ПК.</summary>
+    public static bool SameKey(PairInfo p)
+    {
+        try { return File.Exists(KeyFile) && File.ReadAllText(KeyFile).Trim() == p.Key.Replace("\r\n", "\n").Trim(); }
+        catch { return false; }
+    }
+
     // ---------- Принять код подключения с ПК Claude ----------
     public static string Pair(Options o, string code)
     {
@@ -149,41 +156,102 @@ public static class Tunnel
         "-o", "HostKeyAlias=" + HostAlias, "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR",
     };
 
+    /// <summary>Имя этого ПК Unreal для ПК Claude. Меняется только в тестах.</summary>
+    public static string ComputerName = Environment.MachineName;
+
+    /// <summary>Скрипт туннеля: ssh в цикле с переподключением; перед подключением и раз в 30 с спрашивает у ПК Claude,
+    /// с каким ПК Unreal тот работает, и уступает туннель, если не с этим.</summary>
+    static string BuildScript(Options o, string sshExe)
+    {
+        var target = $"{o.ClaudeUser}@{o.ClaudeHost}";
+        var tunnelArgs = SshArgs(o).Concat(new[]
+        {
+            "-N", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+            "-R", $"127.0.0.1:{o.Port}:{TargetHost}:{o.Port}", "-R", $"127.0.0.1:{o.SmbTunnelPort}:{TargetHost}:445", target,
+        });
+        static string Arg(string a) => a.Length == 0 || a.Contains(' ') ? "\"" + a + "\"" : a;
+        var s = new StringBuilder();
+        s.Append("# UeBridge: обратный SSH-туннель ПК Unreal -> ПК Claude. Запускается задачей планировщика «" + TaskName + "» от имени SYSTEM.\r\n");
+        s.Append("# ПК Claude работает с одним ПК Unreal — с тем, где UeBridge запускали последней (владелец).\r\n");
+        s.Append("# Этот ПК перед подключением и раз в 30 с спрашивает владельца и уступает туннель, если владелец другой.\r\n");
+        s.Append("$log = " + Ps.Q(LogFile) + "\r\n");
+        s.Append("$err = " + Ps.Q(Path.Combine(Win.Dir, "tunnel-ssh.err")) + "\r\n");
+        s.Append("$me = " + Ps.Q(ComputerName) + "\r\n");
+        s.Append("$ssh = " + Ps.Q(sshExe) + "\r\n");
+        s.Append("$checkArgs = @(" + string.Join(", ", SshArgs(o).Append(target).Select(Ps.Q)) + ")\r\n");
+        s.Append("$tunnelArgs = " + Ps.Q(string.Join(" ", tunnelArgs.Select(Arg))) + "\r\n");
+        s.Append(@"function Write-Log($text) {
+    if ((Test-Path $log) -and (Get-Item $log).Length -gt 1MB) { Remove-Item $log }
+    Add-Content -Encoding UTF8 $log ((Get-Date -Format s) + ' ' + $text)
+}
+function Get-Owner {
+    try {
+        $req = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{""action"":""owner""}'))
+        $out = $req | & $ssh @checkArgs 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+        $j = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(([string]($out | Select-Object -Last 1)).Trim())) | ConvertFrom-Json
+        return [string]$j.owner
+    } catch { return $null }
+}
+while ($true) {
+    $owner = Get-Owner
+    if ($owner -and $owner -ne $me) { Write-Log ('wait: ПК Claude работает с ' + $owner); Start-Sleep 60; continue }
+    Write-Log 'start'
+    $p = Start-Process -FilePath $ssh -ArgumentList $tunnelArgs -NoNewWindow -PassThru -RedirectStandardError $err
+    $null = $p.Handle
+    while (-not $p.WaitForExit(30000)) {
+        $owner = Get-Owner
+        if ($owner -and $owner -ne $me) { Write-Log ('yield: ПК Claude переключился на ' + $owner); try { $p.Kill() } catch { }; break }
+    }
+    $p.WaitForExit()
+    if (Test-Path $err) { Get-Content $err | Where-Object { $_ } | ForEach-Object { Write-Log $_ } }
+    Write-Log ('exit ' + $p.ExitCode)
+    Start-Sleep 10
+}
+".Replace("\r\n", "\n").Replace("\n", "\r\n"));
+        return s.ToString();
+    }
+
+    /// <summary>Сообщить ПК Claude, что теперь он работает с этим ПК Unreal. Возвращает имя прежнего ПК Unreal (или пусто).</summary>
+    static string Claim(Options o)
+    {
+        var req = new JsonObject { ["action"] = "claim", ["computer"] = ComputerName };
+        var stdin = Convert.ToBase64String(Encoding.UTF8.GetBytes(req.ToJsonString()));
+        var (code, output, err) = Win.Run(Win.SshExe, SshArgs(o).Append($"{o.ClaudeUser}@{o.ClaudeHost}"), stdin, 60_000);
+        if (code != 0 && err.Contains("неверные данные"))
+            throw new Exception("на ПК Claude старая версия UeBridge — запустите там UeBridge этой же версии и нажмите «Настроить ПК Claude».");
+        if (code != 0) throw new Exception("не удалось связаться с ПК Claude: " + Win.ExplainSsh(err.Length > 0 ? err : output, o.ClaudeHost, o.ClaudePort));
+        try
+        {
+            var j = JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(output.Split('\n').Last().Trim())));
+            return j?["previous"]?.ToString() ?? "";
+        }
+        catch { throw new Exception("ПК Claude ответил непонятно (возможно, на нём старая версия UeBridge — нажмите там «Настроить ПК Claude»): " + output + " " + err); }
+    }
+
     // ---------- Шаг: туннель работает и ПК Claude через него видит MCP и папку ----------
     public static string EnsureTunnel(Options o, Action<string> progress)
     {
         if (!Paired(o)) return "ВНИМАНИЕ: ПК Unreal ещё не связан с ПК Claude — вставьте код подключения с ПК Claude и нажмите «Подключить к ПК Claude».";
 
-        // Скрипт туннеля: ssh в цикле, при обрыве переподключается через 10 с
-        var args = SshArgs(o).Concat(new[]
-        {
-            "-N", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-            "-R", $"127.0.0.1:{o.Port}:{TargetHost}:{o.Port}", "-R", $"127.0.0.1:{o.SmbTunnelPort}:{TargetHost}:445",
-            $"{o.ClaudeUser}@{o.ClaudeHost}",
-        });
-        var script = new StringBuilder();
-        script.Append("# UeBridge: обратный SSH-туннель ПК Unreal -> ПК Claude. Запускается задачей планировщика «" + TaskName + "» от имени SYSTEM.\r\n");
-        script.Append("$log = " + Ps.Q(LogFile) + "\r\n");
-        script.Append("$sshArgs = @(" + string.Join(", ", args.Select(Ps.Q)) + ")\r\n");
-        script.Append("while ($true) {\r\n");
-        script.Append("    if ((Test-Path $log) -and (Get-Item $log).Length -gt 1MB) { Remove-Item $log }\r\n");
-        script.Append("    Add-Content $log ((Get-Date -Format s) + ' start')\r\n");
-        script.Append("    & " + Ps.Q(Win.SshExe) + " @sshArgs 2>&1 | ForEach-Object { Add-Content $log ((Get-Date -Format s) + ' ' + $_) }\r\n");
-        script.Append("    Add-Content $log ((Get-Date -Format s) + ' exit ' + $LASTEXITCODE)\r\n");
-        script.Append("    Start-Sleep 10\r\n");
-        script.Append("}\r\n");
+        // ПК Claude работает с одним ПК Unreal — с тем, где UeBridge запускали последней
+        var prev = Claim(o);
+        progress($"ПК Claude теперь работает с этим ПК Unreal ({ComputerName})"
+                 + (prev.Length > 0 && !prev.Equals(ComputerName, StringComparison.OrdinalIgnoreCase) ? $"; прежний ПК Unreal ({prev}) уступит туннель в течение ~30 с." : "."));
+
+        var script = BuildScript(o, Win.SshExe);
         // Туннель с теми же параметрами уже работает — не рвём его зря (старое подключение держит порты на ПК Claude ещё до ~45 с)
         var started = DateTime.Now;
         string? existing = null;
         try { existing = File.Exists(Script) ? File.ReadAllText(Script) : null; } catch { }
-        if (existing == script.ToString() && SshRunning())
+        if (existing == script && SshRunning())
         {
             progress("Туннель уже работает с теми же параметрами — не перезапускаю.");
             return WaitAndCheck(o, started, progress);
         }
 
         Win.SecureDir();
-        Win.WriteFile(Script, script.ToString(), bom: true);
+        Win.WriteFile(Script, script, bom: true);
         Win.RestrictToAdmins(Script, dir: false);
 
         // Задача планировщика: SYSTEM, при включении ПК, без ограничения времени, перезапуск при сбое
@@ -218,14 +286,14 @@ Start-ScheduledTask -TaskName __TASK__
         return WaitAndCheck(o, started, progress);
     }
 
-    /// <summary>Ждёт, пока ПК Claude через туннель увидит порт папки проекта (до 90 с), и возвращает итог проверки.
-    /// Отказ переадресации — временный: порты ещё держит прежнее подключение, ssh переподключится через 10 с.</summary>
+    /// <summary>Ждёт, пока ПК Claude через туннель увидит порт папки проекта (до 120 с), и возвращает итог проверки.
+    /// Отказ переадресации — временный: порты ещё держит прежнее подключение (этого или другого ПК Unreal), ssh переподключится через 10 с.</summary>
     static string WaitAndCheck(Options o, DateTime started, Action<string> progress)
     {
         var sw = Stopwatch.StartNew();
         string info = "туннель не поднялся";
         bool told = false;
-        while (sw.Elapsed < TimeSpan.FromSeconds(90))
+        while (sw.Elapsed < TimeSpan.FromSeconds(120))
         {
             Thread.Sleep(3000);
             var fail = LastFailure(started);
@@ -233,7 +301,7 @@ Start-ScheduledTask -TaskName __TASK__
                 throw new Exception("туннель не поднялся: " + Win.ExplainSsh(fail, o.ClaudeHost, o.ClaudePort));
             if (fail != null && !told)
             {
-                progress("ПК Claude ещё держит порты прежнего подключения — туннель переподключится сам, жду…");
+                progress("ПК Claude ещё держит порты прежнего подключения (этого или другого ПК Unreal) — туннель переподключится сам, жду…");
                 told = true;
             }
             if (!SshRunning()) continue;
@@ -243,7 +311,7 @@ Start-ScheduledTask -TaskName __TASK__
             if (r.Smb) return r.Mcp ? "OK: туннель работает, " + info : "ВНИМАНИЕ: туннель работает, но MCP не отвечает — " + info;
             if (r.SshError) break;
         }
-        return "ВНИМАНИЕ: проверка со стороны ПК Claude не прошла за 90 с — " + info + ". Журнал туннеля: " + LogFile;
+        return "ВНИМАНИЕ: проверка со стороны ПК Claude не прошла за 120 с — " + info + ". Журнал туннеля: " + LogFile;
     }
 
     /// <summary>Строка журнала туннеля об ошибке, появившаяся после <paramref name="since"/>; null — ошибок нет.</summary>
@@ -258,8 +326,10 @@ Start-ScheduledTask -TaskName __TASK__
                 if (line.Length < 20 || !DateTime.TryParseExact(line[..19], "s", CultureInfo.InvariantCulture, DateTimeStyles.None, out var t)
                     || t < since.AddSeconds(-1)) continue;
                 var text = line[20..];
+                if (text == "start") { err = null; continue; }
+                if (text.StartsWith("wait:")) continue;
                 if (text.StartsWith("exit ")) return err ?? ("ssh завершился с кодом " + text[5..]);
-                if (text != "start") err = text;
+                err = text;
             }
         }
         catch { }

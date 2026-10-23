@@ -285,6 +285,8 @@ ConvertTo-Json -Compress -InputObject ([ordered]@{ sshd = $(if ($svc) { [string]
         {
             var c = JsonNode.Parse(File.ReadAllText(UnrealInfoFile))!;
             int mcp = c["mcpPort"]!.GetValue<int>(), smb = c["smbPort"]!.GetValue<int>();
+            var ownerFile = Path.Combine(Path.GetDirectoryName(UnrealInfoFile)!, "owner.txt");
+            if (File.Exists(ownerFile)) r.Add("ПК Claude сейчас работает с ПК Unreal: " + File.ReadAllText(ownerFile).Trim());
             r.Add($"ПК Unreal {c["computer"]} последний раз присылал данные {c["time"]}: проект {c["share"]}, диск {c["drive"]}");
             bool m = Setup.PortOpen(mcp), s = Setup.PortOpen(smb);
             r.Add($"Туннель от ПК Unreal сейчас: MCP 127.0.0.1:{mcp} — {(m ? "открыт" : "закрыт")}, папка 127.0.0.1:{smb} — {(s ? "открыта" : "закрыта")}");
@@ -343,13 +345,22 @@ function Test-Mcp($port, $path) {
 try {
     $d = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())) | ConvertFrom-Json
     if ($d.action -eq 'selftest') { Out-Result ([ordered]@{ selftest = $true; user = $env:USERNAME }) }
+    $dir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'UeBridge'
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    # Владелец — ПК Unreal, с которым сейчас работает ПК Claude (где UeBridge запускали последней)
+    $ownerFile = Join-Path $dir 'owner.txt'
+    $owner = if (Test-Path $ownerFile) { (Get-Content $ownerFile -Raw).Trim() } else { '' }
+    if ($d.action -eq 'owner') { Out-Result ([ordered]@{ owner = $owner }) }
+    if ($d.action -eq 'claim') {
+        if ([string]$d.computer -notmatch '^[\w.-]{1,63}$') { throw 'неверное имя ПК Unreal' }
+        Set-Content -Encoding UTF8 $ownerFile ([string]$d.computer)
+        Out-Result ([ordered]@{ owner = [string]$d.computer; previous = $owner })
+    }
     if ([string]$d.drive -notmatch '^[D-Z]:$' -or [string]$d.share -notmatch '^[^\\/:*?""<>|]+$' -or [string]$d.urlPath -notmatch '^/[^\s""]*$') { throw 'неверные данные от ПК Unreal' }
     $info = [ordered]@{
         computer = [string]$d.computer; unrealUser = [string]$d.unrealUser; share = [string]$d.share; drive = [string]$d.drive
         mcpPort = [int]$d.mcpPort; urlPath = [string]$d.urlPath; smbPort = [int]$d.smbPort; time = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
-    $dir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'UeBridge'
-    New-Item -ItemType Directory -Force $dir | Out-Null
     ($info | ConvertTo-Json) | Set-Content -Encoding UTF8 (Join-Path $dir 'unrealpc.json')
     Out-Result ([ordered]@{ user = $env:USERNAME; mcpPort = (Test-Port $info.mcpPort); mcp = (Test-Mcp $info.mcpPort $info.urlPath); smbPort = (Test-Port $info.smbPort) })
 } catch { [Console]::Error.Write('ПК Claude: ' + $_.Exception.Message); exit 1 }
@@ -365,6 +376,12 @@ $dir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'UeBridg
 $infoFile = Join-Path $dir 'unrealpc.json'
 if (-not (Test-Path $infoFile)) { Stop-WithMessage 'ПК Unreal ещё ни разу не подключался к этому ПК. На ПК Unreal в UeBridge вставьте код подключения и нажмите «Подключить к ПК Claude».' }
 $c = Get-Content $infoFile -Raw -Encoding UTF8 | ConvertFrom-Json
+# У каждого ПК Unreal свой пользователь и пароль — храним отдельно; при смене ПК Unreal диск переподключаем
+$credFile = Join-Path $dir ('unrealpc-cred-' + (([string]$c.computer) -replace '[^\w.-]', '_') + '.xml')
+$legacyCred = Join-Path $dir 'unrealpc-cred.xml'
+if ((Test-Path $legacyCred) -and -not (Test-Path $credFile)) { Move-Item $legacyCred $credFile }
+$stateFile = Join-Path $dir 'mapped-computer.txt'
+$mappedFrom = if (Test-Path $stateFile) { (Get-Content $stateFile -Raw).Trim() } else { '' }
 
 Write-Host ""[1/3] Жду туннель от ПК Unreal ($($c.computer))...""
 $n = 0
@@ -377,9 +394,8 @@ $drive = [string]$c.drive
 $remote = '\\127.0.0.1\' + $c.share
 Write-Host ""[2/3] Папка проекта $remote -> $drive""
 $m = Get-SmbMapping -LocalPath $drive -ErrorAction SilentlyContinue
-if ($m -and ($m.RemotePath -ne $remote -or -not (Test-Path ($drive + '\')))) { Remove-SmbMapping -LocalPath $drive -Force -ErrorAction SilentlyContinue; $m = $null }
+if ($m -and ($m.RemotePath -ne $remote -or $mappedFrom -ne [string]$c.computer -or -not (Test-Path ($drive + '\')))) { Remove-SmbMapping -LocalPath $drive -Force -ErrorAction SilentlyContinue; $m = $null }
 if (-not $m) {
-    $credFile = Join-Path $dir 'unrealpc-cred.xml'
     $ok = $false
     for ($i = 0; $i -lt 3 -and -not $ok; $i++) {
         if (Test-Path $credFile) { $cred = Import-Clixml $credFile }
@@ -395,6 +411,7 @@ if (-not $m) {
         try {
             New-SmbMapping -LocalPath $drive -RemotePath $remote -TcpPort ([int]$c.smbPort) -Credential $cred | Out-Null
             $cred | Export-Clixml $credFile
+            Set-Content -Encoding UTF8 $stateFile ([string]$c.computer)
             $ok = $true
         } catch {
             Write-Host ('Не удалось подключить папку: ' + $_.Exception.Message) -ForegroundColor Yellow

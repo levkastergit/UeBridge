@@ -125,9 +125,40 @@ public sealed class MainForm : Form
         Shown += async (_, _) =>
         {
             Log($"UE Bridge {Updater.Current}. Запускать на ПК Unreal — там, где установлен Unreal Engine.");
+            PickCodeFromClipboard();
+            if (!File.Exists(_opt.UProject)) await FindProject();
             if (File.Exists(_opt.UProject)) await RefreshStatus();
-            else Log("Выберите файл .uproject и нажмите «Настроить всё».");
+            else Log("Проект Unreal не найден автоматически: выберите файл .uproject («Обзор…») и нажмите «Настроить всё».");
         };
+    }
+
+    /// <summary>Новый ПК Unreal: если в буфере обмена код подключения ПК Claude (например, скопированный в RDP-сеансе), подставить его.</summary>
+    void PickCodeFromClipboard()
+    {
+        try
+        {
+            var text = Clipboard.ContainsText() ? Clipboard.GetText().Trim() : "";
+            if (!text.StartsWith("UEB1-")) return;
+            var p = PairInfo.Decode(text);
+            if (Tunnel.Paired(_opt) && Tunnel.SameKey(p) && _opt.ClaudeHost == p.Host && _opt.ClaudePort == p.Port) return;
+            txtPair.Text = text;
+            Log($"В буфере обмена найден код подключения ПК Claude ({p.User}@{p.Host}) — он будет принят при «Настроить всё».");
+        }
+        catch { }
+    }
+
+    /// <summary>Новый ПК Unreal: найти проект самостоятельно (последний открытый).</summary>
+    async Task FindProject()
+    {
+        Log("Ищу проекты Unreal на этом ПК…");
+        var list = await Task.Run(Setup.FindProjects);
+        if (list.Count == 0) return;
+        txtProject.Text = list[0];
+        txtShare.Text = DefaultShareName();
+        ReadOptions(false);
+        Log("Выбран проект: " + list[0] + (list.Count > 1 ? $"  (найдено {list.Count}; другой можно выбрать кнопкой «Обзор…»)" : ""));
+        foreach (var other in list.Skip(1).Take(5)) Log("    также найден: " + other);
+        Log("Нажмите «Настроить всё».");
     }
 
     static Label Lbl(string text) => new() { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, TextAlign = ContentAlignment.MiddleLeft, Margin = new Padding(3, 6, 6, 3) };
@@ -246,6 +277,13 @@ public sealed class MainForm : Form
             var o = _opt;
             Log("=== Настройка ПК Unreal ===");
             int failed = 0;
+            // Вставленный (или взятый из буфера обмена) код подключения принимаем первым шагом
+            var code = txtPair.Text.Trim();
+            if (code.Length > 0)
+            {
+                if (await Step("Код подключения ПК Claude", () => Tunnel.Pair(o, code))) txtPair.Text = "";
+                else failed++;
+            }
             var paired = Tunnel.Paired(o);
             // В режиме туннеля ПК Unreal сам подключается к ПК Claude, свой SSH-сервер ему не нужен
             if (!paired && !await Step("OpenSSH Server: служба sshd, автозапуск, правило брандмауэра на порт 22", () => Setup.EnsureOpenSsh(s => Log("    " + s)))) failed++;
