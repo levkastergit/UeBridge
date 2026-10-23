@@ -110,7 +110,9 @@ if ($l.Count -eq 0) { throw 'sshd не слушает порт __PORT__' }
         Win.WriteFile(ReceiveScript, ReceivePs1, bom: true);
         Win.WriteFile(ConnectScript, ConnectPs1, bom: true);
         if (File.Exists(DesktopCmd)) File.Delete(DesktopCmd);
-        File.WriteAllText(DesktopCmd, "@echo off\r\nchcp 65001 >nul\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"" + ConnectScript + "\"\r\n", new UTF8Encoding(false));
+        // Код 2 — скрипт сам показал сообщение и дождался Enter; код 1 — непредвиденная ошибка PowerShell: окно не закрываем
+        File.WriteAllText(DesktopCmd, "@echo off\r\nchcp 65001 >nul\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"" + ConnectScript + "\"\r\n"
+                                      + "if errorlevel 2 exit /b\r\nif errorlevel 1 pause\r\n", new UTF8Encoding(false));
         return "OK: " + ReceiveScript + ", " + ConnectScript + ", на рабочем столе — «" + Path.GetFileName(DesktopCmd) + "»";
     }
 
@@ -325,7 +327,14 @@ function Test-Mcp($port, $path) {
         $sid = $resp.Headers['Mcp-Session-Id']
         $rd = New-Object IO.StreamReader($resp.GetResponseStream())
         $ok = $false
-        while ($null -ne ($line = $rd.ReadLine())) { if ($line -match '""jsonrpc""') { $ok = $line -match '""result""|""error""'; break } }
+        if ($resp.ContentType -like 'text/event-stream*') {
+            # SSE: ответ в строке data:
+            while ($null -ne ($line = $rd.ReadLine())) { if ($line -like 'data:*' -and $line -match '""jsonrpc""') { $ok = $line -match '""result""|""error""'; break } }
+        } else {
+            # JSON (сервер Unreal отдаёт его в несколько строк) — читаем целиком
+            $body = $rd.ReadToEnd()
+            $ok = $body -match '""jsonrpc""' -and $body -match '""result""|""error""'
+        }
         $resp.Close()
         if ($sid) { try { $d = [Net.HttpWebRequest]::Create($url); $d.Method = 'DELETE'; $d.Headers.Add('Mcp-Session-Id', $sid); $d.Timeout = 3000; $d.GetResponse().Close() } catch { } }
         if ($ok) { 'ok' } else { 'нет ответа JSON-RPC' }
@@ -350,7 +359,8 @@ try {
 $ErrorActionPreference = 'Stop'
 $Host.UI.RawUI.WindowTitle = 'UeBridge: подключение проекта с ПК Unreal'
 " + PsCommon + @"
-function Stop-WithMessage($msg) { Write-Host $msg -ForegroundColor Yellow; Read-Host 'Нажмите Enter, чтобы закрыть'; exit 1 }
+function Stop-WithMessage($msg) { Write-Host $msg -ForegroundColor Yellow; Read-Host 'Нажмите Enter, чтобы закрыть'; exit 2 }
+trap { Stop-WithMessage ('Ошибка: ' + $_.Exception.Message) }
 $dir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'UeBridge'
 $infoFile = Join-Path $dir 'unrealpc.json'
 if (-not (Test-Path $infoFile)) { Stop-WithMessage 'ПК Unreal ещё ни разу не подключался к этому ПК. На ПК Unreal в UeBridge вставьте код подключения и нажмите «Подключить к ПК Claude».' }
@@ -374,8 +384,13 @@ if (-not $m) {
     for ($i = 0; $i -lt 3 -and -not $ok; $i++) {
         if (Test-Path $credFile) { $cred = Import-Clixml $credFile }
         else {
-            $cred = Get-Credential -UserName $c.unrealUser -Message ""Пароль входа в Windows на ПК Unreal ($($c.computer)). Нужен один раз: дальше он хранится зашифрованным для вашей учётной записи на этом ПК.""
-            if (-not $cred) { Stop-WithMessage 'Пароль не введён.' }
+            # Пароль спрашиваем прямо в этом окне: отдельное окно запроса может открыться позади других окон
+            Write-Host ''
+            Write-Host ""Нужен пароль входа в Windows на ПК Unreal ($($c.computer)) для пользователя $($c.unrealUser)."" -ForegroundColor Cyan
+            Write-Host 'Его спросят один раз: дальше он хранится зашифрованным для вашей учётной записи на этом ПК.' -ForegroundColor Cyan
+            $pw = Read-Host -AsSecureString 'Пароль (символы не отображаются), затем Enter'
+            if ($pw.Length -eq 0) { Stop-WithMessage 'Пароль не введён.' }
+            $cred = New-Object Management.Automation.PSCredential([string]$c.unrealUser, $pw)
         }
         try {
             New-SmbMapping -LocalPath $drive -RemotePath $remote -TcpPort ([int]$c.smbPort) -Credential $cred | Out-Null

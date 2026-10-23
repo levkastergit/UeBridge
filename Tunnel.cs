@@ -172,6 +172,16 @@ public static class Tunnel
         script.Append("    Add-Content $log ((Get-Date -Format s) + ' exit ' + $LASTEXITCODE)\r\n");
         script.Append("    Start-Sleep 10\r\n");
         script.Append("}\r\n");
+        // Туннель с теми же параметрами уже работает — не рвём его зря (старое подключение держит порты на ПК Claude ещё до ~45 с)
+        var started = DateTime.Now;
+        string? existing = null;
+        try { existing = File.Exists(Script) ? File.ReadAllText(Script) : null; } catch { }
+        if (existing == script.ToString() && SshRunning())
+        {
+            progress("Туннель уже работает с теми же параметрами — не перезапускаю.");
+            return WaitAndCheck(o, started, progress);
+        }
+
         Win.SecureDir();
         Win.WriteFile(Script, script.ToString(), bom: true);
         Win.RestrictToAdmins(Script, dir: false);
@@ -192,7 +202,6 @@ public static class Tunnel
   </Settings>
   <Actions Context=""Author""><Exec><Command>powershell.exe</Command><Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{Script}""</Arguments></Exec></Actions>
 </Task>";
-        var started = DateTime.Now;
         var (code, output) = Ps.Run(@"
 $xml = __XML__
 Stop-ScheduledTask -TaskName __TASK__ -ErrorAction SilentlyContinue
@@ -206,19 +215,35 @@ Start-ScheduledTask -TaskName __TASK__
         progress($"Задача планировщика «{TaskName}» запущена: туннель к {o.ClaudeUser}@{o.ClaudeHost}:{o.ClaudePort}, "
                  + $"на ПК Claude откроются 127.0.0.1:{o.Port} (MCP) и 127.0.0.1:{o.SmbTunnelPort} (папка проекта).");
 
-        // Туннель считается поднятым, если ssh проработал 8 с и не вышел
-        var sw = Stopwatch.StartNew();
-        while (sw.Elapsed < TimeSpan.FromSeconds(40))
-        {
-            Thread.Sleep(2000);
-            var fail = LastFailure(started);
-            if (fail != null) throw new Exception("туннель не поднялся: " + Win.ExplainSsh(fail, o.ClaudeHost, o.ClaudePort));
-            if (sw.Elapsed > TimeSpan.FromSeconds(8) && SshRunning()) break;
-        }
-        if (!SshRunning()) throw new Exception("туннель не поднялся за 40 с. Журнал туннеля: " + LogFile);
+        return WaitAndCheck(o, started, progress);
+    }
 
-        var (ok, info) = Check(o);
-        return ok ? "OK: туннель работает, " + info : "ВНИМАНИЕ: туннель поднят, но проверка со стороны ПК Claude не прошла — " + info;
+    /// <summary>Ждёт, пока ПК Claude через туннель увидит порт папки проекта (до 90 с), и возвращает итог проверки.
+    /// Отказ переадресации — временный: порты ещё держит прежнее подключение, ssh переподключится через 10 с.</summary>
+    static string WaitAndCheck(Options o, DateTime started, Action<string> progress)
+    {
+        var sw = Stopwatch.StartNew();
+        string info = "туннель не поднялся";
+        bool told = false;
+        while (sw.Elapsed < TimeSpan.FromSeconds(90))
+        {
+            Thread.Sleep(3000);
+            var fail = LastFailure(started);
+            if (fail != null && !fail.Contains("forwarding failed", StringComparison.OrdinalIgnoreCase))
+                throw new Exception("туннель не поднялся: " + Win.ExplainSsh(fail, o.ClaudeHost, o.ClaudePort));
+            if (fail != null && !told)
+            {
+                progress("ПК Claude ещё держит порты прежнего подключения — туннель переподключится сам, жду…");
+                told = true;
+            }
+            if (!SshRunning()) continue;
+            var r = CheckDetailed(o);
+            info = r.Info;
+            // Порт папки доступен — значит, переадресация работает; MCP может не отвечать, если редактор закрыт
+            if (r.Smb) return r.Mcp ? "OK: туннель работает, " + info : "ВНИМАНИЕ: туннель работает, но MCP не отвечает — " + info;
+            if (r.SshError) break;
+        }
+        return "ВНИМАНИЕ: проверка со стороны ПК Claude не прошла за 90 с — " + info + ". Журнал туннеля: " + LogFile;
     }
 
     /// <summary>Строка журнала туннеля об ошибке, появившаяся после <paramref name="since"/>; null — ошибок нет.</summary>
@@ -252,6 +277,14 @@ Start-ScheduledTask -TaskName __TASK__
     /// <summary>Передаёт ПК Claude данные о проекте и получает от него результат проверки портов туннеля и MCP.</summary>
     public static (bool Ok, string Info) Check(Options o)
     {
+        var r = CheckDetailed(o);
+        return (r.Mcp && r.Smb, r.Info);
+    }
+
+    sealed record CheckResult(bool Mcp, bool Smb, bool SshError, string Info);
+
+    static CheckResult CheckDetailed(Options o)
+    {
         var info = new JsonObject
         {
             ["action"] = "unreal",
@@ -265,14 +298,14 @@ Start-ScheduledTask -TaskName __TASK__
         };
         var stdin = Convert.ToBase64String(Encoding.UTF8.GetBytes(info.ToJsonString()));
         var (code, output, err) = Win.Run(Win.SshExe, SshArgs(o).Append($"{o.ClaudeUser}@{o.ClaudeHost}"), stdin, 60_000);
-        if (code != 0) return (false, Win.ExplainSsh(err.Length > 0 ? err : output, o.ClaudeHost, o.ClaudePort));
+        if (code != 0) return new(false, false, true, Win.ExplainSsh(err.Length > 0 ? err : output, o.ClaudeHost, o.ClaudePort));
         JsonNode? j = null;
         try { j = JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(output.Split('\n').Last().Trim()))); } catch { }
-        if (j == null) return (false, "ПК Claude ответил непонятно: " + output + " " + err);
+        if (j == null) return new(false, false, true, "ПК Claude ответил непонятно: " + output + " " + err);
         bool mcpPort = j["mcpPort"]?.GetValue<bool>() ?? false, mcp = j["mcp"]?.ToString() == "ok", smb = j["smbPort"]?.GetValue<bool>() ?? false;
         var text = $"с ПК Claude ({j["user"]}@{o.ClaudeHost}): MCP {(mcp ? "отвечает" : mcpPort ? "порт открыт, но MCP не ответил: " + j["mcp"] : "порт закрыт")}, "
                    + $"папка проекта (порт {o.SmbTunnelPort}) {(smb ? "доступна" : "недоступна")}";
-        return (mcp && smb, text);
+        return new(mcp, smb, false, text);
     }
 
     /// <summary>Короткое состояние туннеля для строки состояния.</summary>
