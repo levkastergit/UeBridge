@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.Json.Nodes;
+using Microsoft.Win32;
 
 namespace UeBridge;
 
@@ -311,24 +312,41 @@ ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ editors = $eds; list
         var exe = EditorExe(o);
         // Флаги командной строки из документации Epic «Unreal MCP in Unreal Editor»
         var args = $"\"{o.UProject}\" -ModelContextProtocolStartServer -ModelContextProtocolPort={o.Port}";
-        var dir = Path.Combine(Path.GetTempPath(), "UeBridge");
-        Directory.CreateDirectory(dir);
-        var cmd = Path.Combine(dir, "start-editor.cmd");
-        File.WriteAllText(cmd, "@echo off\r\nchcp 65001 >nul\r\n"
-            + (exe != null ? $"start \"\" \"{exe}\" {args}\r\n" : $"start \"\" \"{o.UProject}\"\r\n"), new UTF8Encoding(false));
-        progress("Запускаю Unreal Editor: " + (exe != null ? $"\"{exe}\" {args}" : o.UProject));
-        // Через Проводник файл открывается в сеансе пользователя, как двойным щелчком, — редактор не наследует права администратора
-        Process.Start(new ProcessStartInfo("explorer.exe", "\"" + cmd + "\"") { UseShellExecute = false })?.Dispose();
-        var pid = WaitEditorProcess(o, TimeSpan.FromSeconds(90));
-        if (pid == 0 && exe != null)
+        int pid = 0;
+        if (UProjectAssociated())
         {
-            progress("Через Проводник редактор не запустился — запускаю напрямую.");
+            // Открываем сам .uproject через Проводник — как двойной щелчок: редактор запускается от имени пользователя,
+            // без прав администратора. MCP-сервер стартует по автозапуску из ini (его записывает шаг настроек).
+            // Вспомогательные .cmd во временной папке не создаём: антивирус блокирует такой запуск.
+            progress("Открываю проект в Unreal Editor (как двойным щелчком по " + Path.GetFileName(o.UProject) + ")");
+            Process.Start(new ProcessStartInfo("explorer.exe", "\"" + o.UProject + "\"") { UseShellExecute = false })?.Dispose();
+            pid = WaitEditorProcess(o, TimeSpan.FromSeconds(90));
+            if (pid == 0) progress("Через Проводник редактор не открылся.");
+        }
+        if (pid == 0)
+        {
+            if (exe == null) throw new Exception("не найден UnrealEditor.exe движка этого проекта, а .uproject не открывается двойным щелчком");
+            progress($"Запускаю Unreal Editor напрямую: \"{exe}\" {args}");
             Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false, WorkingDirectory = o.ProjectDir })?.Dispose();
             pid = WaitEditorProcess(o, TimeSpan.FromSeconds(90));
         }
         if (pid == 0) throw new Exception("Unreal Editor с этим проектом не запустился");
         progress($"Unreal Editor запущен (PID {pid}).");
         return pid;
+    }
+
+    /// <summary>Открывается ли .uproject двойным щелчком (связь, которую регистрирует Epic Games Launcher / UnrealVersionSelector).</summary>
+    static bool UProjectAssociated()
+    {
+        try
+        {
+            using var ext = Registry.ClassesRoot.OpenSubKey(".uproject");
+            var progId = ext?.GetValue("") as string;
+            if (string.IsNullOrEmpty(progId)) return false;
+            using var cmd = Registry.ClassesRoot.OpenSubKey(progId + @"\shell\open\command");
+            return !string.IsNullOrEmpty(cmd?.GetValue("") as string);
+        }
+        catch { return false; }
     }
 
     static int WaitEditorProcess(Options o, TimeSpan timeout)
