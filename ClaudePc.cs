@@ -391,34 +391,59 @@ while (-not ((Test-Port $c.smbPort) -and (Test-Port $c.mcpPort))) {
 }
 
 $drive = [string]$c.drive
-$remote = '\\127.0.0.1\' + $c.share
-Write-Host ""[2/3] Папка проекта $remote -> $drive""
+# Туннель слушает 127.0.0.1. Windows ведёт SMB-сессии по имени сервера: после смены ПК Unreal сессия к \\127.0.0.1 под прежним
+# пользователем ещё какое-то время жива (ошибка 1219 «Multiple connections to a server…»), в net use её не видно и без прав
+# администратора не снять — тогда тот же адрес подключаем под другим именем, localhost.
+$names = @('127.0.0.1', 'localhost')
+$sameShare = '^\\\\(127\.0\.0\.1|localhost)\\' + [regex]::Escape([string]$c.share) + '$'
+Write-Host ""[2/3] Папка проекта \\127.0.0.1\$($c.share) -> $drive""
 $m = Get-SmbMapping -LocalPath $drive -ErrorAction SilentlyContinue
-if ($m -and ($m.RemotePath -ne $remote -or $mappedFrom -ne [string]$c.computer -or -not (Test-Path ($drive + '\')))) { Remove-SmbMapping -LocalPath $drive -Force -ErrorAction SilentlyContinue; $m = $null }
+if ($m -and ($m.RemotePath -notmatch $sameShare -or $mappedFrom -ne [string]$c.computer -or -not (Test-Path ($drive + '\')))) { Remove-SmbMapping -LocalPath $drive -Force -ErrorAction SilentlyContinue; $m = $null }
 if (-not $m) {
-    $ok = $false
-    for ($i = 0; $i -lt 3 -and -not $ok; $i++) {
-        if (Test-Path $credFile) { $cred = Import-Clixml $credFile }
-        else {
-            # Пароль спрашиваем прямо в этом окне: отдельное окно запроса может открыться позади других окон
-            Write-Host ''
-            Write-Host ""Нужен пароль входа в Windows на ПК Unreal ($($c.computer)) для пользователя $($c.unrealUser)."" -ForegroundColor Cyan
-            Write-Host 'Его спросят один раз: дальше он хранится зашифрованным для вашей учётной записи на этом ПК.' -ForegroundColor Cyan
-            $pw = Read-Host -AsSecureString 'Пароль (символы не отображаются), затем Enter'
-            if ($pw.Length -eq 0) { Stop-WithMessage 'Пароль не введён.' }
-            $cred = New-Object Management.Automation.PSCredential([string]$c.unrealUser, $pw)
+    # Другие подключения к туннелю (прежняя папка на другой букве или без буквы) мешали бы новому — отключаем
+    Get-SmbMapping -ErrorAction SilentlyContinue | Where-Object { $_.RemotePath -match '^\\\\(127\.0\.0\.1|localhost)\\' } | ForEach-Object {
+        Write-Host (""Отключаю прежнее подключение $($_.RemotePath)"" + $(if ($_.LocalPath) { "" ($($_.LocalPath))"" } else { '' }))
+        $_ | Remove-SmbMapping -Force -ErrorAction SilentlyContinue
+    }
+    $cred = $null; $ok = $false; $asked = 0; $ni = 0
+    while (-not $ok) {
+        if (-not $cred) {
+            if (Test-Path $credFile) { $cred = Import-Clixml $credFile }
+            else {
+                if ($asked -ge 3) { Stop-WithMessage 'Папка проекта не подключена: пароль не подошёл.' }
+                # Пароль спрашиваем прямо в этом окне: отдельное окно запроса может открыться позади других окон
+                Write-Host ''
+                Write-Host ""Нужен пароль входа в Windows на ПК Unreal ($($c.computer)) для пользователя $($c.unrealUser)."" -ForegroundColor Cyan
+                Write-Host 'Его спросят один раз: дальше он хранится зашифрованным для вашей учётной записи на этом ПК.' -ForegroundColor Cyan
+                $pw = Read-Host -AsSecureString 'Пароль (символы не отображаются), затем Enter'
+                if ($pw.Length -eq 0) { Stop-WithMessage 'Пароль не введён.' }
+                $cred = New-Object Management.Automation.PSCredential([string]$c.unrealUser, $pw)
+                $asked++
+            }
         }
+        $remote = '\\' + $names[$ni] + '\' + $c.share
         try {
             New-SmbMapping -LocalPath $drive -RemotePath $remote -TcpPort ([int]$c.smbPort) -Credential $cred | Out-Null
             $cred | Export-Clixml $credFile
             Set-Content -Encoding UTF8 $stateFile ([string]$c.computer)
             $ok = $true
         } catch {
-            Write-Host ('Не удалось подключить папку: ' + $_.Exception.Message) -ForegroundColor Yellow
-            Remove-Item $credFile -ErrorAction SilentlyContinue
+            # Код ошибки Windows берём из FullyQualifiedErrorId (""Windows System Error 1219,New-SmbMapping"") — он не зависит от языка системы
+            $code = if ($_.FullyQualifiedErrorId -match '^Windows System Error (\d+)') { [int]$Matches[1] } else { 0 }
+            if ($code -eq 1326 -or $code -eq 86) {
+                # Неверные имя пользователя или пароль — спрашиваем заново; при других ошибках новый пароль не поможет
+                Write-Host 'Пароль не подошёл.' -ForegroundColor Yellow
+                Remove-Item $credFile -ErrorAction SilentlyContinue
+                $cred = $null
+            } elseif ($ni + 1 -lt $names.Count) {
+                if ($code -eq 1219) { Write-Host ""Windows ещё держит прежнее подключение к \\$($names[$ni]) под другим пользователем — подключаю тот же адрес как \\$($names[$ni + 1])."" }
+                else { Write-Host (""Не удалось через \\$($names[$ni]): "" + $_.Exception.Message.Trim() + "" — пробую \\$($names[$ni + 1])"") -ForegroundColor Yellow }
+                $ni++
+            } elseif ($code -eq 1219) {
+                Stop-WithMessage 'Папка проекта не подключена: Windows ещё держит прежние подключения к папке ПК Unreal под другим пользователем. Закройте программы, работавшие с диском (Cursor, VS Code, Claude Code, окна Проводника), выйдите из Windows и войдите снова (или перезагрузите ПК Claude), затем запустите «Подключить-UE.cmd» ещё раз.'
+            } else { Stop-WithMessage ('Папка проекта не подключена: ' + $_.Exception.Message) }
         }
     }
-    if (-not $ok) { Stop-WithMessage 'Папка проекта не подключена.' }
 }
 
 Write-Host ""[3/3] Открываю $drive\""
